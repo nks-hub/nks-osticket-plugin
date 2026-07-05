@@ -372,7 +372,24 @@ class TicketService
         // Sorting
         $sort = $this->resolveSortField($params['sort'] ?? null);
 
-        // Build database query
+        // Build database query.
+        //
+        // IMPORTANT: use ->values() (flat rows) instead of hydrating full Ticket
+        // models. Iterating hydrated Ticket objects here is pathological on this
+        // osTicket build: materializing even a single row through the auto-joined
+        // QuerySet triggers tens of thousands of INFORMATION_SCHEMA/related lookups
+        // and takes 45s+ per request, which blows past the MCP client's 10s timeout.
+        // values() pulls exactly the columns we need in one query (~1ms) and we map
+        // them to the same response shape in buildSearchResultItemFromRow().
+        $fields = [
+            'ticket_id', 'number', 'status_id', 'dept_id', 'staff_id',
+            'topic_id', 'team_id', 'sla_id',
+            'created', 'updated', 'duedate', 'isoverdue', 'isanswered',
+            'cdata__subject', 'cdata__priority',
+            'status__name', 'dept__name', 'topic__topic',
+            'staff__firstname', 'staff__lastname', 'team__name', 'sla__name',
+        ];
+
         $tickets = Ticket::objects();
 
         // Filter by query (search in subject)
@@ -390,6 +407,9 @@ class TicketService
             $tickets = $tickets->filter(['dept_id' => $deptFilter]);
         }
 
+        // Project to flat rows (no model hydration)
+        $tickets = $tickets->values(...$fields);
+
         // Apply sorting
         $tickets = match ($sort) {
             'updated' => $tickets->order_by('-updated'),
@@ -400,11 +420,14 @@ class TicketService
         // Apply pagination
         $tickets = $tickets->limit($limit)->offset($offset);
 
-        // Build response array
-        return array_map(
-            fn($ticket) => $this->buildSearchResultItem($ticket),
-            iterator_to_array($tickets)
-        );
+        // Build response array from flat rows
+        $priorityMap = $this->loadPriorityMap();
+        $results = [];
+        foreach ($tickets as $row) {
+            $results[] = $this->buildSearchResultItemFromRow($row, $priorityMap);
+        }
+
+        return $results;
     }
 
     /**
@@ -580,33 +603,77 @@ class TicketService
     }
 
     /**
-     * Build search result item
+     * Load priority id => description map (small table, single query)
+     *
+     * @return array<int, string>
      */
-    private function buildSearchResultItem(Ticket $ticket): array
+    private function loadPriorityMap(): array
     {
+        $map = [];
+        if (!defined('PRIORITY_TABLE')) {
+            return $map;
+        }
+        $res = db_query('SELECT priority_id, priority_desc FROM ' . PRIORITY_TABLE);
+        if ($res) {
+            while ($row = db_fetch_array($res)) {
+                $map[(int)$row['priority_id']] = $row['priority_desc'];
+            }
+        }
+        return $map;
+    }
+
+    /**
+     * Build a search result item from a flat values() row.
+     *
+     * Produces the exact same shape as the previous model-based builder, but
+     * without hydrating Ticket models (see searchTickets() for why).
+     *
+     * @param array<string, mixed> $row      Flat row from ORM values()
+     * @param array<int, string>   $priorityMap  priority_id => description
+     * @return array<string, mixed>
+     */
+    private function buildSearchResultItemFromRow(array $row, array $priorityMap): array
+    {
+        $priorityId = isset($row['cdata__priority']) && $row['cdata__priority'] !== null
+            ? (int)$row['cdata__priority']
+            : null;
+
+        $staffId = (int)($row['staff_id'] ?? 0);
+        $staff = null;
+        if ($staffId > 0) {
+            $staff = trim(((string)($row['staff__firstname'] ?? '')) . ' ' . ((string)($row['staff__lastname'] ?? '')));
+            if ($staff === '') {
+                $staff = null;
+            }
+        }
+
+        $topicId = (int)($row['topic_id'] ?? 0);
+        $teamId = (int)($row['team_id'] ?? 0);
+        $slaId = (int)($row['sla_id'] ?? 0);
+
         return [
-            'id' => $ticket->getId(),
-            'number' => $ticket->getNumber(),
-            'subject' => $ticket->getSubject(),
-            'statusId' => $ticket->getStatusId(),
-            'status' => (string)$ticket->getStatus(),
-            'priorityId' => $ticket->getPriorityId(),
-            'priority' => (string)$ticket->getPriority(),
-            'departmentId' => $ticket->getDeptId(),
-            'department' => $ticket->getDept()?->getName(),
-            'topicId' => $ticket->getTopicId(),
-            'topic' => $ticket->getTopic()?->getName(),
-            'created' => $ticket->getCreateDate(),
-            'updated' => $ticket->getUpdateDate(),
-            'dueDate' => $ticket->getDueDate(),
-            'staffId' => $ticket->getStaffId(),
-            'staff' => $ticket->getStaff()?->getName(),
-            'teamId' => $ticket->getTeamId(),
-            'team' => $ticket->getTeam()?->getName(),
-            'slaId' => $ticket->getSLAId(),
-            'sla' => $ticket->getSLA()?->getName(),
-            'isOverdue' => $ticket->isOverdue(),
-            'isAnswered' => $ticket->isAnswered()
+            'id' => (int)$row['ticket_id'],
+            'number' => $row['number'],
+            'subject' => $row['cdata__subject'],
+            'statusId' => (int)$row['status_id'],
+            'status' => $row['status__name'],
+            'priorityId' => $priorityId,
+            'priority' => $priorityId !== null ? ($priorityMap[$priorityId] ?? null) : null,
+            'departmentId' => (int)($row['dept_id'] ?? 0),
+            'department' => $row['dept__name'],
+            'topicId' => $topicId,
+            'topic' => $topicId > 0 ? ($row['topic__topic'] ?? null) : null,
+            'created' => $row['created'],
+            'updated' => $row['updated'],
+            'dueDate' => $row['duedate'],
+            'staffId' => $staffId,
+            'staff' => $staff,
+            'teamId' => $teamId,
+            'team' => $teamId > 0 ? ($row['team__name'] ?? null) : null,
+            'slaId' => $slaId,
+            'sla' => $slaId > 0 ? ($row['sla__name'] ?? null) : null,
+            'isOverdue' => (bool)(int)($row['isoverdue'] ?? 0),
+            'isAnswered' => (bool)(int)($row['isanswered'] ?? 0),
         ];
     }
 

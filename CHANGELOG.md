@@ -10,20 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Nothing yet
 
-### Changed
-- Nothing yet
-
-### Deprecated
-- Nothing yet
-
-### Removed
-- Nothing yet
+## [2.3.5] - 2026-07-05
 
 ### Fixed
-- Nothing yet
-
-### Security
-- Nothing yet
+- `searchTickets` (used by list/search endpoints) no longer hydrates full
+  `Ticket` models. Iterating hydrated models through the auto-joined QuerySet
+  was pathological on osTicket 1.18: materializing even a single row triggered
+  tens of thousands of INFORMATION_SCHEMA/related lookups and took 45s+ per
+  request, causing API clients (e.g. the MCP server with a 10s timeout) to time
+  out. Replaced with a flat `->values()` projection mapped to the identical
+  response shape (~1ms). Priority description resolved via a single lookup map.
 
 ## [2.3.4] - 2026-03-05
 
