@@ -1,0 +1,899 @@
+<?php
+
+// Only include osTicket classes if they exist (not in test environment)
+if (defined('INCLUDE_DIR') && file_exists(INCLUDE_DIR . 'class.plugin.php')) {
+    require_once INCLUDE_DIR . 'class.plugin.php';
+}
+
+if (file_exists(__DIR__ . '/config.php')) {
+    require_once __DIR__ . '/config.php';
+}
+
+/**
+ * API Endpoints Plugin for osTicket 1.18.x
+ *
+ * Extends osTicket API with additional endpoints and parameters:
+ * - POST /tickets with format (markdown/html/text), departmentId, parentTicketId
+ * - Future: GET, UPDATE, SEARCH, STATS endpoints
+ *
+ * Features:
+ * - Signal-based architecture (works with both Standard and Wildcard APIs)
+ * - Markdown Plugin integration via $_POST['format'] bridge
+ * - Subticket support via parentTicketId parameter
+ * - Department selection via departmentId parameter
+ * - No core file modifications needed
+ *
+ * Architecture:
+ * - Uses Signal::connect('api') for route registration
+ * - ExtendedTicketApiController extends TicketApiController
+ * - Validation methods in controller (TDD-covered)
+ */
+class ApiEndpointsPlugin extends Plugin {
+    var $config_class = 'ApiEndpointsConfig';
+
+    // Static config cache for Signal callbacks
+    // Signal callbacks get a new instance without proper config
+    // So we cache config values statically during bootstrap
+    static $cached_config = null;
+
+
+    /**
+     * Only one instance of this plugin makes sense
+     */
+    function isSingleton() {
+        return true;
+    }
+
+    /**
+     * Bootstrap plugin - called when osTicket initializes
+     */
+    function bootstrap() {
+        // Get config from the REAL instance (has proper ID)
+        $config = $this->getConfig();
+
+        // Cache config values statically for Signal callbacks
+        self::$cached_config = [
+            'enabled' => $config->get('enabled'),
+            'require_markdown_plugin' => $config->get('require_markdown_plugin'),
+            'installed_version' => $config->get('installed_version')
+        ];
+
+        // Version tracking and auto-update
+        $this->checkVersion();
+
+        // Only register API routes if plugin is enabled
+        if (!self::$cached_config['enabled']) {
+            return;
+        }
+
+        // Register API routes via Signal
+        // This works for BOTH Standard API and Wildcard API
+        Signal::connect('api', array($this, 'onApiRequest'));
+    }
+
+
+    /**
+     * Inject Admin UI extensions (JavaScript for API Key form)
+     *
+     * Called during bootstrap() to inject JavaScript into API Key admin pages
+     */
+    function injectAdminUi() {
+        global $ost;
+
+        // Check if we're on the API Keys page
+        if (!isset($_SERVER['SCRIPT_NAME']) ||
+            !preg_match('#/scp/apikeys\.php#', $_SERVER['SCRIPT_NAME'])) {
+            return;
+        }
+
+        // Check if $ost is available
+        if (!$ost) {
+            return;
+        }
+
+        // Get API key data if editing existing key
+        $apiKeyId = isset($_REQUEST['id']) ? (int)$_REQUEST['id'] : 0;
+        $canUpdateTickets = '0';
+
+        if ($apiKeyId) {
+            // Secure: Cast to integer to prevent SQL injection
+            $sql = sprintf(
+                'SELECT can_update_tickets FROM %s WHERE id = %d',
+                API_KEY_TABLE,
+                (int)$apiKeyId
+            );
+            $result = db_query($sql);
+            if ($result && ($row = db_fetch_array($result))) {
+                $canUpdateTickets = $row['can_update_tickets'] ?? '0';
+            }
+        }
+
+        // Build JavaScript code
+        $pluginUrl = $this->getPluginUrl();
+        $jsCode = sprintf(
+            '<script>
+            console.log("API Endpoints Plugin: Injecting admin UI extension");
+            console.log("Plugin URL: %s");
+            console.log("Can Update Tickets Value: %s");
+            // Pass current value to JavaScript via hidden input
+            $(document).ready(function() {
+                $("<input type=\"hidden\" name=\"can_update_tickets_value\" value=\"%s\">").appendTo("form");
+            });
+            </script>
+            <script src="%sassets/admin-apikey-extension.js"></script>',
+            $pluginUrl,
+            $canUpdateTickets,
+            $canUpdateTickets,
+            $pluginUrl
+        );
+
+        // Inject into page header
+        $ost->addExtraHeader($jsCode);
+    }
+
+    /**
+     * Handle API Key form submission
+     *
+     * Saves can_update_tickets permission when API Key form is submitted
+     */
+    function handleApiKeyFormSubmission() {
+        // Check if this is an API Key form submission
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST' ||
+            !isset($_SERVER['SCRIPT_NAME']) ||
+            !preg_match('#/scp/apikeys\.php#', $_SERVER['SCRIPT_NAME'])) {
+            return;
+        }
+
+        // Check if this is an add or update action
+        if (!isset($_POST['do']) || !in_array($_POST['do'], ['add', 'update'])) {
+            return;
+        }
+
+        // Get the can_update_tickets value from POST
+        $canUpdateTickets = isset($_POST['can_update_tickets']) ? 1 : 0;
+
+        // For add action, we need to wait until after the key is created
+        // We'll use a shutdown function to update it
+        if ($_POST['do'] === 'add') {
+            $plugin = $this;
+            register_shutdown_function(function() use ($canUpdateTickets, $plugin) {
+                $plugin->updateLatestApiKeyPermission($canUpdateTickets);
+            });
+        }
+        // For update action, we can update directly
+        else if ($_POST['do'] === 'update' && isset($_POST['id'])) {
+            $this->updateApiKeyPermission((int)$_POST['id'], $canUpdateTickets);
+        }
+    }
+
+    /**
+     * Update can_update_tickets permission for a specific API Key
+     *
+     * @param int $apiKeyId API Key ID
+     * @param int $canUpdate Permission value (0 or 1)
+     */
+    function updateApiKeyPermission($apiKeyId, $canUpdate) {
+        $sql = sprintf(
+            'UPDATE %s SET can_update_tickets = %d WHERE id = %d',
+            API_KEY_TABLE,
+            $canUpdate ? 1 : 0,
+            $apiKeyId
+        );
+
+        db_query($sql);
+    }
+
+    /**
+     * Update can_update_tickets permission for the latest created API Key
+     *
+     * @param int $canUpdate Permission value (0 or 1)
+     */
+    function updateLatestApiKeyPermission($canUpdate) {
+        // Get the latest API key ID
+        $sql = sprintf(
+            'SELECT id FROM %s ORDER BY id DESC LIMIT 1',
+            API_KEY_TABLE
+        );
+
+        $result = db_query($sql);
+        if ($result && ($row = db_fetch_array($result))) {
+            $this->updateApiKeyPermission($row['id'], $canUpdate);
+        }
+    }
+
+
+    /**
+     * Get plugin URL for assets
+     *
+     * @return string Plugin URL
+     */
+    function getPluginUrl() {
+        $pluginDir = basename(dirname(__FILE__));
+        return ROOT_PATH . 'include/plugins/' . $pluginDir . '/';
+    }
+
+    /**
+     * Signal handler for API requests
+     *
+     * Called when osTicket's API receives a request (both Standard and Wildcard APIs)
+     * The signal is sent with the dispatcher BEFORE routes are resolved,
+     * so we can add our own routes to handle extended parameters.
+     *
+     * @param PatternFile $dispatcher API route dispatcher
+     */
+    function onApiRequest($dispatcher) {
+        // Check if plugin is enabled (from cached config)
+        if (!self::$cached_config || !self::$cached_config['enabled']) {
+            return;
+        }
+
+        // Load ExtendedTicketApiController
+        require_once __DIR__ . '/controllers/ExtendedTicketApiController.php';
+
+        // Add our extended routes BEFORE the default routes
+        // Note: Dispatcher class has no prepend() method, so we use array_unshift()
+
+        // Route 1: POST /tickets.json - Extended ticket creation
+        array_unshift($dispatcher->urls,
+            url_post("^/tickets\.(?P<format>xml|json|email)$",
+                array($this, 'handleTicketCreation')
+            )
+        );
+
+        // Route 2: PATCH /tickets/{number}.json - Ticket update
+        array_unshift($dispatcher->urls,
+            url("^/tickets/(?P<number>[^/]+)\.(?P<format>json|xml)$",
+                array($this, 'handleTicketUpdate'),
+                false,  // $args
+                array('PATCH', 'PUT')  // $method
+            )
+        );
+    }
+
+    /**
+     * Handle ticket creation with extended parameters
+     *
+     * Note: API key validation is handled by ExtendedTicketApiController->requireApiKey()
+     * which is called internally by create() method
+     *
+     * @param string $format Response format (json|xml|email)
+     * @return mixed API response
+     */
+    function handleTicketCreation($format) {
+        // Create controller instance (pass null as we'll use $_POST directly)
+        // API key validation is done internally by create() via requireApiKey()
+        $controller = new ExtendedTicketApiController(null);
+
+        // Validate and process extended parameters BEFORE ticket creation
+        try {
+            // Parse JSON body if Content-Type is application/json
+            if (isset($_SERVER['CONTENT_TYPE']) &&
+                strpos($_SERVER['CONTENT_TYPE'], 'application/json') !== false) {
+                $body = file_get_contents('php://input');
+                $data = json_decode($body, true);
+                if ($data) {
+                    $_POST = array_merge($_POST, $data);
+                }
+            }
+
+            // 1. Validate format parameter (if provided)
+            if (isset($_POST['format'])) {
+                $format_param = $controller->validateFormat($_POST['format']);
+
+                // Check if Markdown plugin is required and active
+                if ($format_param === 'markdown' &&
+                    self::$cached_config['require_markdown_plugin']) {
+                    if (!$controller->isMarkdownPluginActive()) {
+                        throw new Exception(
+                            'Markdown Support plugin is required but not active', 400
+                        );
+                    }
+                }
+            }
+
+            // 2. Validate departmentId parameter (if provided)
+            if (isset($_POST['departmentId'])) {
+                $deptId = $controller->validateDepartmentId($_POST['departmentId']);
+                // Map to 'deptId' for ExtendedTicketApiController::createTicket()
+                $_POST['deptId'] = $deptId;
+                // Remove original key to prevent osTicket core from flagging it
+                // as "Unexpected data received in API request"
+                unset($_POST['departmentId']);
+            }
+
+            // 3. Validate parentTicketNumber parameter (if provided)
+            // User provides the visible ticket NUMBER, we convert to internal ticket ID
+            // Note: Validation happens here, but parent-child relationship
+            // is set in ExtendedTicketApiController->createTicket() AFTER ticket creation
+            if (isset($_POST['parentTicketNumber'])) {
+                $parentId = $controller->validateParentTicketId($_POST['parentTicketNumber']);
+                $_POST['parentTicketNumber'] = $parentId; // Store the resolved ID
+            }
+
+            // All validations passed - delegate to controller
+            // Controller will handle parent-child relationship internally
+            $ticketController = new ExtendedTicketApiController(null);
+
+            // Skip API key validation in create() - we already validated it above
+            $ticketController->setSkipApiKeyValidation(true);
+
+            $result = $ticketController->create($format);
+            return $result;
+
+        } catch (Exception $e) {
+            // Validation failed - return error response
+            Http::response(400, $e->getMessage(), 'text/plain');
+            return;
+        }
+    }
+
+    /**
+     * Handle ticket update with extended parameters
+     *
+     * Supports PATCH/PUT requests to update ticket properties that can't be set
+     * during creation due to osTicket's internal rules (e.g., departmentId)
+     *
+     * @param string $number Ticket number
+     * @param string $format Response format (json|xml)
+     * @return mixed API response
+     */
+    function handleTicketUpdate($number, $format) {
+        // Create controller instance
+        $controller = new ExtendedTicketApiController(null);
+
+        try {
+            // Parse JSON body
+            if (isset($_SERVER['CONTENT_TYPE']) &&
+                strpos($_SERVER['CONTENT_TYPE'], 'application/json') !== false) {
+                $body = file_get_contents('php://input');
+                $data = json_decode($body, true);
+                if (!$data) {
+                    throw new Exception('Invalid JSON body', 400);
+                }
+            } elseif ($_POST) {
+                $data = $_POST;
+            } else {
+                throw new Exception('No data provided', 400);
+            }
+
+            // Delegate to controller - handles validation and update logic
+            $ticket = $controller->update($number, $data);
+
+            // Return success with ticket number
+            Http::response(200, $ticket->getNumber(), 'text/plain');
+
+        } catch (Exception $e) {
+            // Update failed - return appropriate error response
+            $code = $e->getCode() ?: 400;
+            if ($code == 401) {
+                Http::response(401, $e->getMessage(), 'text/plain');
+            } elseif ($code == 404) {
+                Http::response(404, $e->getMessage(), 'text/plain');
+            } else {
+                Http::response(400, $e->getMessage(), 'text/plain');
+            }
+            return;
+        }
+    }
+
+    /**
+     * Check plugin version and perform updates if needed
+     */
+    function checkVersion() {
+        $plugin_file = INCLUDE_DIR . 'plugins/' . basename(dirname(__FILE__)) . '/plugin.php';
+
+        if (!file_exists($plugin_file)) {
+            return;
+        }
+
+        $plugin_info = include($plugin_file);
+        $current_version = $plugin_info['version'];
+        $installed_version = $this->getConfig()->get('installed_version');
+
+        if (!$installed_version || version_compare($installed_version, $current_version, '<')) {
+            $this->performUpdate($installed_version, $current_version);
+        }
+    }
+
+    /**
+     * Perform plugin update
+     *
+     * @param string $from_version Old version
+     * @param string $to_version New version
+     */
+    function performUpdate($from_version, $to_version) {
+        $errors = array();
+
+        // Extend API Key table (adds missing columns if needed)
+        $this->extendApiKeyTable($errors);
+
+        // Re-deploy API files on update (ensures latest version)
+        $this->deployApiFiles($errors);
+
+        // Save new version
+        $this->getConfig()->set('installed_version', $to_version);
+    }
+
+    /**
+     * Called when plugin is enabled in admin panel
+     */
+    function enable() {
+        error_log('[API Endpoints] Plugin enable() called');
+        $errors = array();
+
+        // Auto-create instance for singleton plugin
+        if ($this->isSingleton() && $this->getNumInstances() === 0) {
+            $vars = array(
+                'name' => $this->getName(),
+                'isactive' => 1,
+                'notes' => 'Auto-created singleton instance'
+            );
+
+            if (!$this->addInstance($vars, $errors)) {
+                return $errors;
+            }
+        }
+
+        // IMPORTANT: Clean up any leftover files from previous installations
+        // This is necessary because osTicket does NOT call uninstall hooks when deleting plugins
+        // It only removes DB entries, leaving files behind
+        error_log('[API Endpoints] Cleaning up old installation files (if any)...');
+        $this->performCleanup();
+
+        // Extend API Key table with new permissions
+        $this->extendApiKeyTable($errors);
+
+        // Deploy API file to /api/
+        $this->deployApiFiles($errors);
+
+        // Get current version from plugin.php
+        $plugin_file = INCLUDE_DIR . 'plugins/' . basename(dirname(__FILE__)) . '/plugin.php';
+
+        if (file_exists($plugin_file)) {
+            $plugin_info = include($plugin_file);
+            $this->getConfig()->set('installed_version', $plugin_info['version']);
+        }
+
+        error_log('[API Endpoints] Plugin enabled successfully');
+        return empty($errors) ? true : $errors;
+    }
+
+    /**
+     * Helper: Add column to API key table if it doesn't exist
+     *
+     * @param string $columnName Column name to add
+     * @param string $columnDefinition Full column definition (e.g., "TINYINT(1) UNSIGNED NOT NULL DEFAULT 0")
+     * @param string $afterColumn Column to add after (optional)
+     * @param array $errors Error messages array (by reference)
+     * @return bool True on success
+     */
+    private function addColumnIfNotExists($columnName, $columnDefinition, $afterColumn = null, &$errors = array()) {
+        $table = API_KEY_TABLE;
+
+        // Secure: Escape column name for LIKE query
+        $escapedColumnName = db_real_escape($columnName);
+        $sql = sprintf("SHOW COLUMNS FROM `%s` LIKE '%s'", $table, $escapedColumnName);
+        $result = db_query($sql);
+
+        if (!$result || db_num_rows($result) == 0) {
+            // Column doesn't exist, add it
+            $alterSql = sprintf("ALTER TABLE `%s` ADD COLUMN `%s` %s",
+                $table,
+                $columnName,  // Column name in backticks for safety
+                $columnDefinition
+            );
+
+            if ($afterColumn) {
+                $alterSql .= sprintf(" AFTER `%s`", $afterColumn);
+            }
+
+            if (!db_query($alterSql)) {
+                $errors[] = sprintf('Failed to add %s column to API key table', $columnName);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Extend API Key table with new permissions
+     *
+     * @param array $errors Error messages array (by reference)
+     * @return bool True on success
+     */
+    function extendApiKeyTable(&$errors) {
+        $success = true;
+
+        // Define columns to add with their definitions and position
+        $columns = array(
+            array(
+                'name' => 'can_update_tickets',
+                'definition' => 'TINYINT(1) UNSIGNED NOT NULL DEFAULT 0',
+                'after' => 'can_create_tickets'
+            ),
+            array(
+                'name' => 'can_read_tickets',
+                'definition' => 'TINYINT(1) UNSIGNED NOT NULL DEFAULT 0',
+                'after' => 'can_update_tickets'
+            ),
+            array(
+                'name' => 'can_search_tickets',
+                'definition' => 'TINYINT(1) UNSIGNED NOT NULL DEFAULT 0',
+                'after' => 'can_read_tickets'
+            ),
+            array(
+                'name' => 'can_delete_tickets',
+                'definition' => 'TINYINT(1) UNSIGNED NOT NULL DEFAULT 0',
+                'after' => 'can_search_tickets'
+            ),
+            array(
+                'name' => 'can_read_stats',
+                'definition' => 'TINYINT(1) UNSIGNED NOT NULL DEFAULT 0',
+                'after' => 'can_delete_tickets'
+            ),
+            array(
+                'name' => 'can_manage_subtickets',
+                'definition' => 'TINYINT(1) UNSIGNED NOT NULL DEFAULT 0',
+                'after' => 'can_read_stats'
+            )
+        );
+
+        // Add each column using helper method
+        foreach ($columns as $column) {
+            if (!$this->addColumnIfNotExists(
+                $column['name'],
+                $column['definition'],
+                $column['after'],
+                $errors
+            )) {
+                $success = false;
+            }
+        }
+
+        return $success;
+    }
+
+    /**
+     * Helper: Remove column from API key table if it exists
+     *
+     * @param string $columnName Column name to remove
+     * @return bool True on success
+     */
+    private function removeColumnIfExists($columnName) {
+        $table = API_KEY_TABLE;
+
+        // Secure: Escape column name for LIKE query
+        $escapedColumnName = db_real_escape($columnName);
+        $sql = sprintf("SHOW COLUMNS FROM `%s` LIKE '%s'", $table, $escapedColumnName);
+        $result = db_query($sql);
+
+        if ($result && db_num_rows($result) > 0) {
+            // Column exists, remove it
+            error_log('[API Endpoints] Removing column: ' . $columnName);
+            $sql = sprintf("ALTER TABLE `%s` DROP COLUMN `%s`", $table, $columnName);
+            if (!db_query($sql)) {
+                error_log('[API Endpoints] FAILED to remove column: ' . $columnName);
+                return false;
+            }
+            error_log('[API Endpoints] Successfully removed column: ' . $columnName);
+        } else {
+            error_log('[API Endpoints] Column does not exist (already removed?): ' . $columnName);
+        }
+
+        return true;
+    }
+
+    /**
+     * Remove extended columns from API Key table
+     *
+     * @return bool True on success
+     */
+    function removeApiKeyTableExtensions() {
+        error_log('[API Endpoints] Removing database columns from api_key table...');
+        $success = true;
+        $removed_count = 0;
+        $failed_count = 0;
+
+        // List of columns to remove (in reverse order of adding)
+        $columnsToRemove = array(
+            'can_manage_subtickets',
+            'can_read_stats',
+            'can_delete_tickets',
+            'can_search_tickets',
+            'can_read_tickets',
+            'can_update_tickets'
+        );
+
+        // Remove each column using helper method
+        foreach ($columnsToRemove as $columnName) {
+            if ($this->removeColumnIfExists($columnName)) {
+                $removed_count++;
+            } else {
+                $failed_count++;
+                $success = false;
+            }
+        }
+
+        error_log(sprintf('[API Endpoints] Database cleanup: %d columns removed, %d failed', $removed_count, $failed_count));
+
+        return $success;
+    }
+
+    /**
+     * Deploy API files to /api/ directory (DYNAMIC)
+     *
+     * Scans plugin's api/ directory and deploys all *.php files automatically.
+     * No need to manually add new endpoints to this method!
+     *
+     * @param array $errors Error messages array (by reference)
+     * @return bool True on success
+     */
+    function deployApiFiles(&$errors) {
+        $success = true;
+
+        // Get plugin's api/ directory
+        $source_dir = __DIR__ . '/api/';
+        $target_dir = INCLUDE_DIR . '../api/';
+
+        // Check if source directory exists
+        if (!is_dir($source_dir)) {
+            $errors[] = 'Plugin API directory not found: ' . $source_dir;
+            return false;
+        }
+
+        // Scan for all PHP files in plugin's api/ directory
+        $api_files = glob($source_dir . '*.php');
+
+        if (empty($api_files)) {
+            $errors[] = 'No API files found in plugin directory: ' . $source_dir;
+            return false;
+        }
+
+        // Deploy each file
+        foreach ($api_files as $source_file) {
+            $filename = basename($source_file);
+            $target_file = $target_dir . $filename;
+
+            if (!copy($source_file, $target_file)) {
+                $errors[] = sprintf('Failed to deploy %s to /api/', $filename);
+                $success = false;
+            }
+        }
+
+        // Add .htaccess rules for all deployed files
+        $this->addHtaccessRule($errors);
+
+        return $success;
+    }
+
+    /**
+     * Add rewrite rules to /api/.htaccess (STATIC TEMPLATE)
+     *
+     * Reads htaccess.template from plugin directory and inserts the rules
+     * into /api/.htaccess. This is more stable than dynamically generating rules.
+     *
+     * Template file: include/plugins/api-endpoints/htaccess.template
+     * Target file: api/.htaccess
+     *
+     * @param array $errors Error messages array (by reference)
+     * @return bool True on success
+     */
+    function addHtaccessRule(&$errors) {
+        $htaccess_file = INCLUDE_DIR . '../api/.htaccess';
+        $template_file = __DIR__ . '/htaccess.template';
+
+        // Check if .htaccess exists
+        if (!file_exists($htaccess_file)) {
+            $errors[] = 'Warning: .htaccess not found in /api/ - you may need to add rewrite rules manually';
+            return false;
+        }
+
+        // Check if template exists
+        if (!file_exists($template_file)) {
+            $errors[] = 'Warning: htaccess.template not found in plugin directory';
+            return false;
+        }
+
+        // Read current .htaccess
+        $content = file_get_contents($htaccess_file);
+
+        // Read template
+        $template_rules = file_get_contents($template_file);
+
+        // Check if rules are already present (look for marker comment)
+        if (strpos($content, 'API Endpoints Plugin - Apache Rewrite Rules') !== false) {
+            // Rules already exist - REMOVE them first, then insert fresh copy
+            // This ensures updates to htaccess.template are always applied
+            error_log('[API Endpoints] Replacing existing .htaccess rules with updated template');
+            $this->removeHtaccessRule();
+
+            // Re-read .htaccess after removal
+            $content = file_get_contents($htaccess_file);
+        }
+
+        // Find insertion point (after wildcard rule, before default osTicket rule)
+        $wildcard_pos = strpos($content, 'RewriteRule ^wildcard/');
+        $insert_pos = false;
+
+        if ($wildcard_pos !== false) {
+            // Insert after wildcard rule (find end of line)
+            $insert_pos = strpos($content, "\n", $wildcard_pos) + 1;
+        } else {
+            // Fallback: Look for default API rule comment
+            $default_comment_pos = strpos($content, '# Default API endpoint');
+            if ($default_comment_pos !== false) {
+                $insert_pos = $default_comment_pos;
+            } else {
+                // Fallback: Insert before </IfModule>
+                $ifmodule_pos = strpos($content, '</IfModule>');
+                if ($ifmodule_pos !== false) {
+                    $insert_pos = $ifmodule_pos;
+                }
+            }
+        }
+
+        if ($insert_pos === false) {
+            $errors[] = 'Warning: Could not find insertion point in .htaccess';
+            return false;
+        }
+
+        // Insert template rules
+        $content = substr_replace($content, "\n" . $template_rules . "\n", $insert_pos, 0);
+
+        // Write back to file
+        if (!file_put_contents($htaccess_file, $content)) {
+            $errors[] = 'Failed to update .htaccess - you may need to add rewrite rules manually';
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Remove rewrite rules from /api/.htaccess (STATIC TEMPLATE)
+     *
+     * Removes the entire template block from .htaccess by finding the marker comment.
+     * Works even after plugin directory is deleted!
+     *
+     * @return bool True on success
+     */
+    function removeHtaccessRule() {
+        $htaccess_file = INCLUDE_DIR . '../api/.htaccess';
+
+        if (!file_exists($htaccess_file)) {
+            error_log('[API Endpoints] .htaccess not found: ' . $htaccess_file);
+            return true; // Nothing to clean
+        }
+
+        $content = file_get_contents($htaccess_file);
+        if ($content === false) {
+            error_log('[API Endpoints] FAILED to read .htaccess: ' . $htaccess_file);
+            return false;
+        }
+
+        // Find start of our template block (marker comment)
+        $marker = '# =============================================================================';
+        $start_pos = strpos($content, $marker . "\n# API Endpoints Plugin - Apache Rewrite Rules");
+
+        if ($start_pos === false) {
+            error_log('[API Endpoints] No .htaccess rules found to remove (marker not found)');
+            return true; // Nothing to remove
+        }
+
+        // Find end of template block (next empty line or closing IfModule)
+        // The template ends with the last RewriteRule line, so we look for the pattern:
+        // RewriteRule ^tickets-subtickets-unlink\.php/ - [L]
+        $search_start = $start_pos;
+        $end_marker = 'RewriteRule ^tickets-subtickets-unlink\.php/ - [L]';
+        $end_pos = strpos($content, $end_marker, $search_start);
+
+        if ($end_pos === false) {
+            // Fallback: look for any RewriteRule pattern and find the last one in our block
+            error_log('[API Endpoints] Could not find end marker, using fallback pattern');
+            // Find all RewriteRule lines after start_pos until we hit a non-tickets rule
+            preg_match('/RewriteRule \^tickets-[^\n]+\n(?!\s*RewriteRule \^tickets-)/',
+                       substr($content, $start_pos), $matches, PREG_OFFSET_CAPTURE);
+            if (!empty($matches)) {
+                $end_pos = $start_pos + $matches[0][1] + strlen($matches[0][0]);
+            } else {
+                error_log('[API Endpoints] Could not determine end of template block');
+                return false;
+            }
+        } else {
+            // Move past the end marker line
+            $end_pos = strpos($content, "\n", $end_pos) + 1;
+        }
+
+        // Remove the entire block (including leading newline)
+        $content = substr_replace($content, '', $start_pos, $end_pos - $start_pos);
+
+        // Write back
+        $result = file_put_contents($htaccess_file, $content);
+        if ($result === false) {
+            error_log('[API Endpoints] FAILED to write .htaccess: ' . $htaccess_file . ' (check permissions)');
+            return false;
+        }
+
+        error_log('[API Endpoints] Removed .htaccess template block');
+        return true;
+    }
+
+    /**
+     * Remove deployed API files from /api/ directory (DYNAMIC)
+     *
+     * Scans /api/ directory for files deployed by this plugin and removes them.
+     * Works even after plugin directory is deleted!
+     *
+     * @return bool True on success
+     */
+    function removeApiFiles() {
+        // Remove .htaccess rules first
+        $this->removeHtaccessRule();
+
+        // Scan /api/ directory for our deployed files (tickets-*.php pattern)
+        $target_dir = INCLUDE_DIR . '../api/';
+
+        // Check if target directory exists
+        if (!is_dir($target_dir)) {
+            error_log('[API Endpoints] Target directory does not exist: ' . $target_dir);
+            return false;
+        }
+
+        $deployed_files = glob($target_dir . 'tickets-*.php');
+
+        if (empty($deployed_files)) {
+            error_log('[API Endpoints] No tickets-*.php files found in: ' . $target_dir);
+            return true; // No files to remove
+        }
+
+        // Remove each deployed file
+        $removed_count = 0;
+        $failed_count = 0;
+        foreach ($deployed_files as $target_file) {
+            if (file_exists($target_file)) {
+                if (unlink($target_file)) {
+                    $removed_count++;
+                    error_log('[API Endpoints] Removed: ' . basename($target_file));
+                } else {
+                    $failed_count++;
+                    error_log('[API Endpoints] FAILED to remove: ' . $target_file . ' (check permissions)');
+                }
+            }
+        }
+
+        error_log(sprintf('[API Endpoints] Cleanup complete: %d removed, %d failed', $removed_count, $failed_count));
+
+        return ($failed_count === 0);
+    }
+
+    /**
+     * Called when plugin is disabled in admin panel
+     *
+     * Note: We don't remove files here because the plugin might be temporarily disabled
+     * for testing purposes. Files and database columns remain intact.
+     */
+    function disable() {
+        // Do nothing - plugin can be re-enabled without losing configuration
+        return true;
+    }
+
+    /**
+     * Perform cleanup operations
+     *
+     * Called from enable() to clean up leftover files from previous installations.
+     *
+     * NOTE: osTicket does NOT call uninstall/disable hooks when deleting plugins!
+     * It only removes database entries, leaving files behind. Therefore we clean up
+     * old files during enable() before deploying new ones.
+     */
+    private function performCleanup() {
+        // Remove deployed API files and .htaccess rules (if any exist)
+        if (!$this->removeApiFiles()) {
+            error_log('[API Endpoints] WARNING: File removal had errors (check permissions)');
+        }
+
+        // Do NOT remove database columns here - they should persist across reinstalls
+        // Database columns are only removed if user manually uninstalls AND cleans up
+    }
+}
