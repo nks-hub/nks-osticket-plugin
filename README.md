@@ -82,6 +82,7 @@ GET /api/nks-osticket.php?action=tickets.list&status=open&limit=5
 | `tickets.create` | `subject`, `message`, `name?`, `email?`, `topicId?`, `priority?` | create |
 | `tickets.update` | `number`, `status?`, `dueDate?`, `topicId?`, `note?`, `staffId?` | update |
 | `tickets.reply` | `number`, `response`, `title?`, `alert?`, `staffId?`, `replyTo?`, `attachments?` | reply |
+| `tickets.assign` | `number`, `assigneeId`, `note?`, `alert?`, `staffId?`, `reassign?` | assign |
 | `tickets.delete` | `number` | delete |
 | `subtickets.link` | `parent`, `child` | manage subtickets |
 | `subtickets.unlink` | `child` | manage subtickets |
@@ -91,13 +92,15 @@ GET /api/nks-osticket.php?action=tickets.list&status=open&limit=5
 
 `sort` is one of `created` (default, newest first), `updated`, `number`. `status` accepts canonical states (`open`, `closed`, `resolved`, `archived`) or a numeric status id. `staffId` is the agent a reply or note is posted as (default `1`). `replyTo` is `all` (default), `user` or `collabs`.
 
+`tickets.assign` assigns the ticket to the agent `assigneeId` through osTicket's own `assignToStaff()`: it logs the `assigned` event with the acting agent (`staffId`), posts `note` as an internal note and sends the assignment alert (`alert`, default `true`). An assignee who is inactive or on vacation is rejected with `422`. A ticket that already has an assignee returns `409` unless `reassign` is `true`; assigning to the current assignee changes nothing.
+
 `attachments` on `tickets.reply` is a list of `{ "name": "screenshot.jpg", "type": "image/jpeg", "data": "<base64>" }`. The files are stored on the reply and sent with its email when **Admin Panel → Settings → Emails → Attachments** is on. Each file is capped by osTicket's maximum file size setting; a larger one is rejected with `413`. The response reports how many attachments were stored.
 
 `tickets.get` returns an `attachments` array on each thread entry (`fileId`, `name`, `type`, `size`, `inline`, `cid`). `fileId` is the id `attachments.download` expects, and `cid` matches the `cid:<...>` markers inline images use in the entry body.
 
 ## Authentication
 
-Uses osTicket's native API keys (**Admin Panel → Manage → API Keys**). Each key is bound to a source IP and carries granular permission columns (`can_read_tickets`, `can_search_tickets`, `can_create_tickets`, `can_update_tickets`, `can_reply_tickets`, `can_delete_tickets`, `can_read_stats`, `can_manage_subtickets`). On an IP mismatch the API returns the IP it observed, so the key can be bound to it.
+Uses osTicket's native API keys (**Admin Panel → Manage → API Keys**). Each key is bound to a source address (an exact IP, `*` for any, a wildcard like `172.16.4.*`, IPv4 CIDR like `172.16.0.0/16`, or `regex:/.../`) and carries granular permission columns (`can_read_tickets`, `can_search_tickets`, `can_create_tickets`, `can_update_tickets`, `can_reply_tickets`, `can_delete_tickets`, `can_read_stats`, `can_manage_subtickets`, `can_assign_tickets`). On an IP mismatch the API returns the IP it observed, so the key can be bound to it.
 
 ### Granting permissions
 

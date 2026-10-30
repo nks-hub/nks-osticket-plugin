@@ -19,7 +19,7 @@ require_once __DIR__ . '/Handlers/AttachmentsHandler.php';
 
 final class Kernel
 {
-    public const VERSION = '1.2.1';
+    public const VERSION = '1.4.0';
 
     /**
      * Route table: action => [permission columns (OR), callable factory].
@@ -34,6 +34,7 @@ final class Kernel
         'tickets.create'      => ['perms' => ['can_create_tickets'],                      'call' => ['TicketsHandler', 'create']],
         'tickets.update'      => ['perms' => ['can_update_tickets'],                      'call' => ['TicketsHandler', 'update']],
         'tickets.reply'       => ['perms' => ['can_reply_tickets'],                       'call' => ['TicketsHandler', 'reply']],
+        'tickets.assign'      => ['perms' => ['can_assign_tickets'],                      'call' => ['TicketsHandler', 'assign']],
         'tickets.delete'      => ['perms' => ['can_delete_tickets'],                      'call' => ['TicketsHandler', 'delete']],
         'subtickets.link'     => ['perms' => ['can_manage_subtickets'],                   'call' => ['SubticketsHandler', 'link']],
         'subtickets.unlink'   => ['perms' => ['can_manage_subtickets'],                   'call' => ['SubticketsHandler', 'unlink']],

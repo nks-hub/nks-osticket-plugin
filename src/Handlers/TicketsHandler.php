@@ -1,7 +1,7 @@
 <?php
 /**
  * Ticket operations: list, search, get, stats, statuses, create, update,
- * reply, delete.
+ * reply, assign, delete.
  *
  * Read paths use osTicket's ORM `->values()` projection (flat rows) instead of
  * hydrating full Ticket models — hydration through the auto-joined QuerySet is
@@ -287,6 +287,47 @@ final class TicketsHandler
             'posted' => true,
             'attachments' => $entry->getAttachments()->count(),
         ];
+    }
+
+    /**
+     * Assigns the ticket to an agent through Ticket::assignToStaff(), so
+     * osTicket logs the "assigned" event (with the acting agent), posts the
+     * optional comment as an internal note and sends the assignment alert.
+     * An already assigned ticket is only reassigned with `reassign: true`.
+     *
+     * @param array<string,mixed> $params
+     * @return array<string,mixed>
+     */
+    public function assign(array $params): array
+    {
+        $ticket = $this->lookup($params);
+        $assigneeId = (int)($params['assigneeId'] ?? 0);
+        if ($assigneeId <= 0) {
+            throw new ApiException('assign requires "assigneeId" (staff id of the new assignee)', 400);
+        }
+        $assignee = \Staff::lookup($assigneeId);
+        if (!$assignee) {
+            throw new ApiException('Unknown assignee: ' . $assigneeId, 404);
+        }
+        if (!$assignee->isAvailable()) {
+            throw new ApiException('Assignee ' . $assigneeId . ' is not available (inactive or on vacation)', 422);
+        }
+
+        $current = (int)$ticket->getStaffId();
+        if ($current === $assigneeId) {
+            return ['number' => $ticket->getNumber(), 'assigned' => false, 'reason' => 'already assigned to this agent', 'ticket' => $this->summary($ticket)];
+        }
+        if ($current > 0 && empty($params['reassign'])) {
+            throw new ApiException('Ticket is already assigned to staff ' . $current . '; pass "reassign": true to change it', 409);
+        }
+
+        $this->actingStaff($params);
+        if (!$ticket->assignToStaff($assignee, (string)($params['note'] ?? ''), (bool)($params['alert'] ?? true))) {
+            throw new ApiException('Assignment failed', 500);
+        }
+
+        $ticket = $this->reload($ticket->getNumber());
+        return ['number' => $ticket->getNumber(), 'assigned' => true, 'ticket' => $this->summary($ticket)];
     }
 
     /**

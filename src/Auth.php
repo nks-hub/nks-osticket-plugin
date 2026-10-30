@@ -21,7 +21,7 @@ final class Auth
     public const PERMISSION_COLUMNS = [
         'can_read_tickets', 'can_search_tickets', 'can_create_tickets',
         'can_update_tickets', 'can_reply_tickets', 'can_delete_tickets',
-        'can_read_stats', 'can_manage_subtickets',
+        'can_read_stats', 'can_manage_subtickets', 'can_assign_tickets',
     ];
 
     /** @var array<string,mixed> Raw api key row. */
@@ -72,11 +72,43 @@ final class Auth
 
         // IP binding: osTicket keys are pinned to a source IP. Surface the seen
         // IP on mismatch so operators can configure the key without guessing.
-        if (!empty($row['ipaddr']) && $row['ipaddr'] !== $ip) {
+        if (!self::ipAllowed((string)($row['ipaddr'] ?? ''), $ip)) {
             Http::fail(401, 'API key not authorized for this source IP', ['client_ip' => $ip]);
         }
 
         return new self($row);
+    }
+
+    /**
+     * Whether the key's bound address admits the caller. Empty and "*" admit
+     * any address (wildcard keys); "*" inside an address ("172.16.4.*"),
+     * IPv4 CIDR ("172.16.0.0/16") and "regex:/.../" admit a range.
+     */
+    public static function ipAllowed(string $allowed, string $ip): bool
+    {
+        $allowed = trim($allowed);
+        if ($allowed === '' || $allowed === '*' || $allowed === $ip) {
+            return true;
+        }
+        if (strncmp($allowed, 'regex:', 6) === 0) {
+            return @preg_match(substr($allowed, 6), $ip) === 1;
+        }
+        if (strpos($allowed, '*') !== false) {
+            $re = '/^' . str_replace('\*', '[0-9A-Fa-f:.]*', preg_quote($allowed, '/')) . '$/';
+            return (bool)preg_match($re, $ip);
+        }
+        if (strpos($allowed, '/') !== false) {
+            [$net, $bits] = explode('/', $allowed, 2);
+            $n = ip2long($net);
+            $i = ip2long($ip);
+            $b = (int)$bits;
+            if ($n === false || $i === false || $b < 0 || $b > 32) {
+                return false;
+            }
+            $mask = $b === 0 ? 0 : ((-1 << (32 - $b)) & 0xFFFFFFFF);
+            return ($n & $mask) === ($i & $mask);
+        }
+        return false;
     }
 
     public function keyId(): int
