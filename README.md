@@ -100,7 +100,7 @@ GET /api/nks-osticket.php?action=tickets.list&status=open&limit=5
 
 ## Authentication
 
-Uses osTicket's native API keys (**Admin Panel → Manage → API Keys**). Each key is bound to a source address (an exact IP, `*` for any, a wildcard like `172.16.4.*`, IPv4 CIDR like `172.16.0.0/16`, or `regex:/.../`) and carries granular permission columns (`can_read_tickets`, `can_search_tickets`, `can_create_tickets`, `can_update_tickets`, `can_reply_tickets`, `can_delete_tickets`, `can_read_stats`, `can_manage_subtickets`, `can_assign_tickets`). On an IP mismatch the API returns the IP it observed, so the key can be bound to it.
+Uses osTicket's native API keys (**Admin Panel → Manage → API Keys**). Each key is bound to a source address (an exact IP, `*` for any, a wildcard like `172.16.4.*`, IPv4 CIDR like `172.16.0.0/16`, or `regex:/.../`) and carries granular permission columns (`can_read_tickets`, `can_search_tickets`, `can_create_tickets`, `can_update_tickets`, `can_reply_tickets`, `can_delete_tickets`, `can_read_stats`, `can_manage_subtickets`, `can_assign_tickets`). On an IP mismatch the API returns the IP it observed, so the key can be bound to it. The admin panel only accepts an exact IP when a key is created, so a wildcard, CIDR or regex address is set in the database: `UPDATE ost_api_key SET ipaddr = '172.16.0.0/16' WHERE id = 1`.
 
 ### Granting permissions
 

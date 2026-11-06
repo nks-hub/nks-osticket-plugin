@@ -102,7 +102,7 @@ final class Auth
             $n = ip2long($net);
             $i = ip2long($ip);
             $b = (int)$bits;
-            if ($n === false || $i === false || $b < 0 || $b > 32) {
+            if ($n === false || $i === false || !ctype_digit($bits) || $b > 32) {
                 return false;
             }
             $mask = $b === 0 ? 0 : ((-1 << (32 - $b)) & 0xFFFFFFFF);

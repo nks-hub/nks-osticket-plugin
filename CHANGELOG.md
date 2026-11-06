@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.4.0] - 2026-10-30
+## [1.4.0] - 2026-11-06
 
 ### Added
 - `tickets.assign` assigns a ticket to an agent (`assigneeId`) via
@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `409` unless `reassign` is `true`. Needs the new `can_assign_tickets`
   permission column, created on first use like the others.
 - API key addresses accept `*` (any), wildcards (`172.16.4.*`), IPv4 CIDR
-  (`172.16.0.0/16`) and `regex:/.../` besides an exact IP.
+  (`172.16.0.0/16`) and `regex:/.../` besides an exact IP. A CIDR with a
+  missing or non-numeric prefix length (`10.0.0.0/`, `10.0.0.0/x`) is rejected
+  instead of admitting every address.
 
 ### Fixed
 - `Kernel::VERSION` (reported by `meta.ping`) matches the plugin version again.
